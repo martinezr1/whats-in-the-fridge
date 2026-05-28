@@ -1,0 +1,414 @@
+import json
+import os
+import uuid
+import shutil
+import urllib.request
+import urllib.parse
+from datetime import datetime, date
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+from PIL import Image
+
+import models
+import database
+
+app = FastAPI(title="What's in the Fridge")
+
+models.Base.metadata.create_all(bind=database.engine)
+
+# Migrate existing DBs that predate added columns
+with database.engine.connect() as _conn:
+    for ddl in [
+        "ALTER TABLE fridge_items ADD COLUMN quantity INTEGER NOT NULL DEFAULT 1",
+        "ALTER TABLE fridge_items ADD COLUMN expiration_date DATE",
+    ]:
+        try:
+            _conn.execute(text(ddl))
+            _conn.commit()
+        except Exception:
+            pass
+
+UPLOAD_DIR = Path("/data/uploads")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+THUMBNAIL_SIZE = (400, 400)
+
+SPOONACULAR_API_KEY = os.getenv("SPOONACULAR_API_KEY", "")
+
+SUGGESTION_CACHE_FILE = Path("/data/suggestion_cache.json")
+
+def _load_suggestion_cache() -> dict:
+    try:
+        return json.loads(SUGGESTION_CACHE_FILE.read_text())
+    except Exception:
+        return {}
+
+def _save_suggestion_cache(cache: dict) -> None:
+    try:
+        SUGGESTION_CACHE_FILE.write_text(json.dumps(cache))
+    except Exception:
+        pass
+
+suggestion_cache: dict = _load_suggestion_cache()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --- Schemas ---
+
+class AddToFridgeRequest(BaseModel):
+    expiration_date: Optional[str] = None
+
+
+class FridgeItemOut(BaseModel):
+    id: int
+    saved_food_id: Optional[int]
+    name: str
+    description: str
+    date_added: datetime
+    image_path: Optional[str]
+    active: bool
+    quantity: int
+    expiration_date: Optional[date] = None
+
+    class Config:
+        from_attributes = True
+
+
+class SavedFoodOut(BaseModel):
+    id: int
+    name: str
+    description: str
+    default_image_path: Optional[str]
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+# --- Helpers ---
+
+def save_image(file: UploadFile) -> str:
+    ext = Path(file.filename).suffix.lower() if file.filename else ".jpg"
+    if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+        ext = ".jpg"
+    filename = f"{uuid.uuid4().hex}{ext}"
+    dest = UPLOAD_DIR / filename
+    with dest.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+    try:
+        img = Image.open(dest)
+        img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
+        img.save(dest)
+    except Exception:
+        pass
+    return filename
+
+
+def download_image(url: str) -> Optional[str]:
+    ext = Path(url.split("?")[0]).suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+        ext = ".jpg"
+    filename = f"{uuid.uuid4().hex}{ext}"
+    dest = UPLOAD_DIR / filename
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            dest.write_bytes(resp.read())
+        img = Image.open(dest)
+        img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
+        img.save(dest)
+    except Exception:
+        if dest.exists():
+            dest.unlink()
+        return None
+    return filename
+
+
+# --- Fridge endpoints ---
+
+@app.get("/api/fridge", response_model=list[FridgeItemOut])
+def list_fridge(db: Session = Depends(database.get_db)):
+    return (
+        db.query(models.FridgeItem)
+        .filter(models.FridgeItem.active == True)
+        .order_by(models.FridgeItem.date_added.desc())
+        .all()
+    )
+
+
+@app.post("/api/fridge", response_model=FridgeItemOut)
+async def add_fridge_item(
+    name: str = Form(...),
+    description: str = Form(""),
+    date_added: str = Form(...),
+    quantity: int = Form(1),
+    expiration_date: Optional[str] = Form(None),
+    image: Optional[UploadFile] = File(None),
+    image_url: Optional[str] = Form(None),
+    db: Session = Depends(database.get_db),
+):
+    image_path = None
+    if image and image.filename:
+        image_path = save_image(image)
+    elif image_url:
+        image_path = download_image(image_url)
+
+    try:
+        parsed_date = datetime.fromisoformat(date_added)
+    except ValueError:
+        parsed_date = datetime.utcnow()
+
+    parsed_exp = None
+    if expiration_date:
+        try:
+            parsed_exp = datetime.strptime(expiration_date, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+
+    item = models.FridgeItem(
+        name=name,
+        description=description,
+        date_added=parsed_date,
+        image_path=image_path,
+        quantity=max(1, quantity),
+        expiration_date=parsed_exp,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+@app.delete("/api/fridge/{item_id}")
+def remove_fridge_item(item_id: int, db: Session = Depends(database.get_db)):
+    item = db.query(models.FridgeItem).filter(models.FridgeItem.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    if item.quantity > 1:
+        item.quantity -= 1
+        db.commit()
+        return {"ok": True, "quantity": item.quantity}
+    item.active = False
+    db.commit()
+    return {"ok": True, "quantity": 0}
+
+
+@app.patch("/api/fridge/{item_id}", response_model=FridgeItemOut)
+async def update_fridge_item(
+    item_id: int,
+    name: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    date_added: Optional[str] = Form(None),
+    quantity: Optional[int] = Form(None),
+    expiration_date: Optional[str] = Form(None),
+    image: Optional[UploadFile] = File(None),
+    db: Session = Depends(database.get_db),
+):
+    item = db.query(models.FridgeItem).filter(models.FridgeItem.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    if name is not None:
+        item.name = name
+    if description is not None:
+        item.description = description
+    if date_added is not None:
+        try:
+            item.date_added = datetime.fromisoformat(date_added)
+        except ValueError:
+            pass
+    if quantity is not None:
+        item.quantity = max(1, quantity)
+    if expiration_date is not None:
+        item.expiration_date = (
+            datetime.strptime(expiration_date, "%Y-%m-%d").date()
+            if expiration_date else None
+        )
+    if image and image.filename:
+        item.image_path = save_image(image)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+@app.post("/api/fridge/{item_id}/save-to-library", response_model=SavedFoodOut)
+def save_item_to_library(item_id: int, db: Session = Depends(database.get_db)):
+    item = db.query(models.FridgeItem).filter(models.FridgeItem.id == item_id).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+    existing = (
+        db.query(models.SavedFood)
+        .filter(models.SavedFood.name.ilike(item.name))
+        .first()
+    )
+    if existing:
+        return existing
+    saved = models.SavedFood(
+        name=item.name,
+        description=item.description,
+        default_image_path=item.image_path,
+    )
+    db.add(saved)
+    db.commit()
+    db.refresh(saved)
+    return saved
+
+
+# --- Library endpoints ---
+
+@app.get("/api/library", response_model=list[SavedFoodOut])
+def list_library(db: Session = Depends(database.get_db)):
+    return (
+        db.query(models.SavedFood)
+        .order_by(models.SavedFood.name)
+        .all()
+    )
+
+
+@app.post("/api/library", response_model=SavedFoodOut)
+async def create_saved_food(
+    name: str = Form(...),
+    description: str = Form(""),
+    image: Optional[UploadFile] = File(None),
+    db: Session = Depends(database.get_db),
+):
+    image_path = None
+    if image and image.filename:
+        image_path = save_image(image)
+
+    saved = models.SavedFood(name=name, description=description, default_image_path=image_path)
+    db.add(saved)
+    db.commit()
+    db.refresh(saved)
+    return saved
+
+
+@app.delete("/api/library/{saved_id}")
+def delete_saved_food(saved_id: int, db: Session = Depends(database.get_db)):
+    saved = db.query(models.SavedFood).filter(models.SavedFood.id == saved_id).first()
+    if not saved:
+        raise HTTPException(status_code=404, detail="Saved food not found")
+    db.delete(saved)
+    db.commit()
+    return {"ok": True}
+
+
+@app.patch("/api/library/{saved_id}", response_model=SavedFoodOut)
+async def update_saved_food(
+    saved_id: int,
+    name: Optional[str] = Form(None),
+    description: Optional[str] = Form(None),
+    image: Optional[UploadFile] = File(None),
+    db: Session = Depends(database.get_db),
+):
+    saved = db.query(models.SavedFood).filter(models.SavedFood.id == saved_id).first()
+    if not saved:
+        raise HTTPException(status_code=404, detail="Saved food not found")
+    if name is not None:
+        saved.name = name
+    if description is not None:
+        saved.description = description
+    if image and image.filename:
+        saved.default_image_path = save_image(image)
+    db.commit()
+    db.refresh(saved)
+    return saved
+
+
+@app.post("/api/library/{saved_id}/add-to-fridge", response_model=FridgeItemOut)
+def add_from_library(saved_id: int, request: AddToFridgeRequest, db: Session = Depends(database.get_db)):
+    saved = db.query(models.SavedFood).filter(models.SavedFood.id == saved_id).first()
+    if not saved:
+        raise HTTPException(status_code=404, detail="Saved food not found")
+
+    parsed_exp = None
+    if request.expiration_date:
+        try:
+            parsed_exp = datetime.strptime(request.expiration_date, "%Y-%m-%d").date()
+        except ValueError:
+            pass
+
+    # Match on saved_food_id AND expiration_date — different expirations are separate entries
+    q = db.query(models.FridgeItem).filter(
+        models.FridgeItem.saved_food_id == saved_id,
+        models.FridgeItem.active == True,
+    )
+    existing = (
+        q.filter(models.FridgeItem.expiration_date == None).first()
+        if parsed_exp is None
+        else q.filter(models.FridgeItem.expiration_date == parsed_exp).first()
+    )
+
+    if existing:
+        existing.quantity += 1
+        db.commit()
+        db.refresh(existing)
+        return existing
+
+    item = models.FridgeItem(
+        saved_food_id=saved.id,
+        name=saved.name,
+        description=saved.description,
+        date_added=datetime.utcnow(),
+        image_path=saved.default_image_path,
+        expiration_date=parsed_exp,
+    )
+    db.add(item)
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+# --- Image suggestion ---
+
+@app.get("/api/suggest-cache")
+def get_suggestion_cache():
+    return suggestion_cache
+
+
+@app.get("/api/suggest-image")
+def suggest_image(q: str):
+    cache_key = q.lower().strip()
+    if cache_key in suggestion_cache:
+        return {"image_url": suggestion_cache[cache_key]}
+
+    if not SPOONACULAR_API_KEY:
+        raise HTTPException(status_code=503, detail="Image suggestions not configured")
+    try:
+        url = (
+            "https://api.spoonacular.com/food/ingredients/search"
+            f"?query={urllib.parse.quote(q)}&number=1&apiKey={SPOONACULAR_API_KEY}"
+        )
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read())
+        results = data.get("results", [])
+        if not results or not results[0].get("image"):
+            raise HTTPException(status_code=404, detail="No image found")
+        cdn_url = f"https://spoonacular.com/cdn/ingredients_500x500/{results[0]['image']}"
+        suggestion_cache[cache_key] = cdn_url
+        _save_suggestion_cache(suggestion_cache)
+        return {"image_url": cdn_url}
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=404, detail="No image found")
+
+
+# --- Static files (last so API routes take priority) ---
+
+app.mount("/uploads", StaticFiles(directory="/data/uploads"), name="uploads")
+app.mount("/", StaticFiles(directory="/app/frontend", html=True), name="frontend")

@@ -1,0 +1,22 @@
+services:
+  witf:
+    build: .
+    container_name: whats-in-the-fridge
+    networks:
+      - proxy-network
+      - default 
+    ports:
+      - "8082:8082"
+    volumes:
+      - witf-data:/data
+      - ./frontend:/app/frontend
+    environment:
+      - SPOONACULAR_API_KEY=${SPOONACULAR_API_KEY:-}
+    restart: unless-stopped
+
+volumes:
+  witf-data:
+
+networks:
+  proxy-network:
+    external: true

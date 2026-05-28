@@ -1,0 +1,21 @@
+{
+  "name": "What's in the Fridge?",
+  "short_name": "WITF",
+  "description": "Track your food, reduce waste",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#e8f4f8",
+  "theme_color": "#1a78c2",
+  "icons": [
+    {
+      "src": "/mascot.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/mascot.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}
