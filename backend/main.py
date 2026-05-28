@@ -116,7 +116,7 @@ def is_safe_url(url: str) -> bool:
             return False
         ip = socket.gethostbyname(hostname)
         addr = ipaddress.ip_address(ip)
-        return not (addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved)
+        return not (addr.is_private or addr.is_loopback or addr.is_link_local)
     except Exception:
         return False
 
