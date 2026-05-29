@@ -1,3 +1,4 @@
+import io
 import ipaddress
 import json
 import os
@@ -43,6 +44,8 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 THUMBNAIL_SIZE = (400, 400)
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
+ALLOWED_FORMATS = {"JPEG", "PNG", "GIF", "WEBP"}
+FORMAT_EXT = {"JPEG": ".jpg", "PNG": ".png", "GIF": ".gif", "WEBP": ".webp"}
 
 SPOONACULAR_API_KEY = os.getenv("SPOONACULAR_API_KEY", "")
 
@@ -106,6 +109,14 @@ class SavedFoodOut(BaseModel):
 
 # --- Helpers ---
 
+def _get_image_format(data: bytes) -> Optional[str]:
+    try:
+        fmt = Image.open(io.BytesIO(data)).format
+        return fmt if fmt in ALLOWED_FORMATS else None
+    except Exception:
+        return None
+
+
 def is_safe_url(url: str) -> bool:
     try:
         parsed = urllib.parse.urlparse(url)
@@ -122,13 +133,13 @@ def is_safe_url(url: str) -> bool:
 
 
 def save_image(file: UploadFile) -> str:
-    ext = Path(file.filename).suffix.lower() if file.filename else ".jpg"
-    if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
-        ext = ".jpg"
     contents = file.file.read(MAX_IMAGE_BYTES + 1)
     if len(contents) > MAX_IMAGE_BYTES:
         raise HTTPException(status_code=413, detail="Image too large (max 10 MB)")
-    filename = f"{uuid.uuid4().hex}{ext}"
+    fmt = _get_image_format(contents)
+    if fmt is None:
+        raise HTTPException(status_code=415, detail="Invalid or unsupported image format")
+    filename = f"{uuid.uuid4().hex}{FORMAT_EXT[fmt]}"
     dest = UPLOAD_DIR / filename
     dest.write_bytes(contents)
     try:
@@ -143,11 +154,7 @@ def save_image(file: UploadFile) -> str:
 def download_image(url: str) -> Optional[str]:
     if not is_safe_url(url):
         return None
-    ext = Path(url.split("?")[0]).suffix.lower()
-    if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
-        ext = ".jpg"
-    filename = f"{uuid.uuid4().hex}{ext}"
-    dest = UPLOAD_DIR / filename
+    dest = None
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -156,15 +163,20 @@ def download_image(url: str) -> Optional[str]:
                 data += chunk
                 if len(data) > MAX_IMAGE_BYTES:
                     return None
-            dest.write_bytes(data)
+        fmt = _get_image_format(data)
+        if fmt is None:
+            return None
+        filename = f"{uuid.uuid4().hex}{FORMAT_EXT[fmt]}"
+        dest = UPLOAD_DIR / filename
+        dest.write_bytes(data)
         img = Image.open(dest)
         img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
         img.save(dest)
+        return filename
     except Exception:
-        if dest.exists():
+        if dest and dest.exists():
             dest.unlink()
         return None
-    return filename
 
 
 # --- Fridge endpoints ---
