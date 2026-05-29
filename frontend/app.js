@@ -42,8 +42,9 @@ function setupTabs() {
 
 // --- Date helpers ---
 function setTodayDate() {
-  const today = new Date().toISOString().split('T')[0];
-  document.getElementById('item-date').value = today;
+  const d = new Date();
+  const local = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  document.getElementById('item-date').value = local;
 }
 
 function formatDate(iso) {
@@ -285,7 +286,7 @@ function imgSrc(path) {
 
 function cardImage(imagePath, fallback = '🥡') {
   if (imagePath) {
-    return `<div class="card-img"><img src="${imgSrc(imagePath)}" alt="food" loading="lazy"></div>`;
+    return `<div class="card-img"><img src="${esc(imgSrc(imagePath))}" alt="food" loading="lazy"></div>`;
   }
   return `<div class="card-img">${fallback}</div>`;
 }

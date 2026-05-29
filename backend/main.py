@@ -1,10 +1,12 @@
+import ipaddress
 import json
 import os
+import socket
 import uuid
 import shutil
 import urllib.request
 import urllib.parse
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +42,7 @@ UPLOAD_DIR = Path("/data/uploads")
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 THUMBNAIL_SIZE = (400, 400)
+MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
 
 SPOONACULAR_API_KEY = os.getenv("SPOONACULAR_API_KEY", "")
 
@@ -53,7 +56,9 @@ def _load_suggestion_cache() -> dict:
 
 def _save_suggestion_cache(cache: dict) -> None:
     try:
-        SUGGESTION_CACHE_FILE.write_text(json.dumps(cache))
+        tmp = SUGGESTION_CACHE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache))
+        tmp.replace(SUGGESTION_CACHE_FILE)
     except Exception:
         pass
 
@@ -61,9 +66,9 @@ suggestion_cache: dict = _load_suggestion_cache()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["http://localhost:8082"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
+    allow_headers=["Content-Type"],
 )
 
 
@@ -101,14 +106,31 @@ class SavedFoodOut(BaseModel):
 
 # --- Helpers ---
 
+def is_safe_url(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        ip = socket.gethostbyname(hostname)
+        addr = ipaddress.ip_address(ip)
+        return not (addr.is_private or addr.is_loopback or addr.is_link_local)
+    except Exception:
+        return False
+
+
 def save_image(file: UploadFile) -> str:
     ext = Path(file.filename).suffix.lower() if file.filename else ".jpg"
     if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
         ext = ".jpg"
+    contents = file.file.read(MAX_IMAGE_BYTES + 1)
+    if len(contents) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image too large (max 10 MB)")
     filename = f"{uuid.uuid4().hex}{ext}"
     dest = UPLOAD_DIR / filename
-    with dest.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
+    dest.write_bytes(contents)
     try:
         img = Image.open(dest)
         img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
@@ -119,6 +141,8 @@ def save_image(file: UploadFile) -> str:
 
 
 def download_image(url: str) -> Optional[str]:
+    if not is_safe_url(url):
+        return None
     ext = Path(url.split("?")[0]).suffix.lower()
     if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
         ext = ".jpg"
@@ -127,7 +151,12 @@ def download_image(url: str) -> Optional[str]:
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=8) as resp:
-            dest.write_bytes(resp.read())
+            data = b""
+            while chunk := resp.read(65536):
+                data += chunk
+                if len(data) > MAX_IMAGE_BYTES:
+                    return None
+            dest.write_bytes(data)
         img = Image.open(dest)
         img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
         img.save(dest)
@@ -170,7 +199,7 @@ async def add_fridge_item(
     try:
         parsed_date = datetime.fromisoformat(date_added)
     except ValueError:
-        parsed_date = datetime.utcnow()
+        parsed_date = datetime.now(timezone.utc)
 
     parsed_exp = None
     if expiration_date:
@@ -362,7 +391,7 @@ def add_from_library(saved_id: int, request: AddToFridgeRequest, db: Session = D
         saved_food_id=saved.id,
         name=saved.name,
         description=saved.description,
-        date_added=datetime.utcnow(),
+        date_added=datetime.now(timezone.utc),
         image_path=saved.default_image_path,
         expiration_date=parsed_exp,
     )
@@ -390,9 +419,9 @@ def suggest_image(q: str):
     try:
         url = (
             "https://api.spoonacular.com/food/ingredients/search"
-            f"?query={urllib.parse.quote(q)}&number=1&apiKey={SPOONACULAR_API_KEY}"
+            f"?query={urllib.parse.quote(q)}&number=1"
         )
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "x-api-key": SPOONACULAR_API_KEY})
         with urllib.request.urlopen(req, timeout=8) as resp:
             data = json.loads(resp.read())
         results = data.get("results", [])
