@@ -52,8 +52,8 @@ Built to run on a Raspberry Pi (or any Docker host) with no cloud dependencies.
 ### 1. Clone the repo
 
 ```bash
-git clone git@github.com:youruser/WITF.git
-cd WITF
+git clone git@github.com:martinezr1/whats-in-the-fridge.git
+cd whats-in-the-fridge
 ```
 
 ### 2. (Optional) Set your Spoonacular API key
@@ -121,7 +121,7 @@ All data lives inside the `witf-data` Docker volume:
 | `/data/uploads/` | Uploaded and processed images |
 | `/data/suggestion_cache.json` | Cached Spoonacular responses |
 
-Images are automatically resized to a 400 px thumbnail on upload. The database schema is migrated automatically at startup — no manual steps needed when updating.
+Images are automatically padded to a 400×400 square (white background, full image preserved — no cropping) on upload. The database schema is migrated automatically at startup — no manual steps needed when updating.
 
 ---
 
