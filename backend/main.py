@@ -1,12 +1,14 @@
+import http.client
 import io
 import ipaddress
 import json
 import os
 import socket
+import ssl
 import uuid
 import shutil
-import urllib.request
 import urllib.parse
+import urllib.request
 from datetime import datetime, date, timezone
 from pathlib import Path
 from typing import Optional
@@ -46,6 +48,7 @@ THUMBNAIL_SIZE = (400, 400)
 MAX_IMAGE_BYTES = 10 * 1024 * 1024  # 10 MB
 ALLOWED_FORMATS = {"JPEG", "PNG", "GIF", "WEBP"}
 FORMAT_EXT = {"JPEG": ".jpg", "PNG": ".png", "GIF": ".gif", "WEBP": ".webp"}
+Image.MAX_IMAGE_PIXELS = 50_000_000  # ~7000×7000; raises DecompressionBombError above this
 
 SPOONACULAR_API_KEY = os.getenv("SPOONACULAR_API_KEY", "")
 
@@ -117,19 +120,31 @@ def _get_image_format(data: bytes) -> Optional[str]:
         return None
 
 
-def is_safe_url(url: str) -> bool:
+def _resolve_safe(url: str):
+    """
+    Resolve the URL hostname once and validate the resulting IP is not private/loopback.
+    Returns (scheme, ip, port, path, hostname) so the caller can connect directly to
+    the pre-resolved IP — eliminating the DNS rebinding window between check and fetch.
+    Returns None if the URL is unsafe or unparseable.
+    """
     try:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ("http", "https"):
-            return False
+            return None
         hostname = parsed.hostname
         if not hostname:
-            return False
+            return None
         ip = socket.gethostbyname(hostname)
         addr = ipaddress.ip_address(ip)
-        return not (addr.is_private or addr.is_loopback or addr.is_link_local)
+        if addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_reserved:
+            return None
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        return (parsed.scheme, ip, port, path, hostname)
     except Exception:
-        return False
+        return None
 
 
 def save_image(file: UploadFile) -> str:
@@ -143,35 +158,62 @@ def save_image(file: UploadFile) -> str:
     dest = UPLOAD_DIR / filename
     dest.write_bytes(contents)
     try:
-        img = Image.open(dest)
-        img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
-        img.save(dest)
+        with Image.open(dest) as img:
+            img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
+            img.save(dest)
+    except Image.DecompressionBombError:
+        dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=413, detail="Image dimensions too large")
     except Exception:
         pass
     return filename
 
 
 def download_image(url: str) -> Optional[str]:
-    if not is_safe_url(url):
+    resolved = _resolve_safe(url)
+    if resolved is None:
         return None
+    scheme, ip, port, path, hostname = resolved
     dest = None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            data = b""
-            while chunk := resp.read(65536):
-                data += chunk
-                if len(data) > MAX_IMAGE_BYTES:
-                    return None
+        # Connect directly to the pre-resolved IP so no second DNS lookup occurs.
+        # For HTTPS, TLS still verifies the certificate against the original hostname.
+        raw = socket.create_connection((ip, port), timeout=8)
+        if scheme == "https":
+            ctx = ssl.create_default_context()
+            sock = ctx.wrap_socket(raw, server_hostname=hostname)
+            conn = http.client.HTTPSConnection(hostname, timeout=8)
+        else:
+            sock = raw
+            conn = http.client.HTTPConnection(ip, timeout=8)
+        conn.sock = sock  # inject pre-connected socket; skips connect() / second DNS lookup
+        conn.request("GET", path, headers={"User-Agent": "Mozilla/5.0", "Host": hostname})
+        resp = conn.getresponse()
+        if resp.status != 200:
+            conn.close()
+            return None
+        data = b""
+        while chunk := resp.read(65536):
+            data += chunk
+            if len(data) > MAX_IMAGE_BYTES:
+                conn.close()
+                return None
+        conn.close()
         fmt = _get_image_format(data)
         if fmt is None:
             return None
         filename = f"{uuid.uuid4().hex}{FORMAT_EXT[fmt]}"
         dest = UPLOAD_DIR / filename
         dest.write_bytes(data)
-        img = Image.open(dest)
-        img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
-        img.save(dest)
+        try:
+            with Image.open(dest) as img:
+                img.thumbnail(THUMBNAIL_SIZE, Image.LANCZOS)
+                img.save(dest)
+        except Image.DecompressionBombError:
+            dest.unlink(missing_ok=True)
+            return None
+        except Exception:
+            pass
         return filename
     except Exception:
         if dest and dest.exists():
