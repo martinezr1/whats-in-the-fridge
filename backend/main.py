@@ -170,35 +170,51 @@ def save_image(file: UploadFile) -> str:
 
 
 def download_image(url: str) -> Optional[str]:
-    resolved = _resolve_safe(url)
-    if resolved is None:
-        return None
-    scheme, ip, port, path, hostname = resolved
     dest = None
     try:
-        # Connect directly to the pre-resolved IP so no second DNS lookup occurs.
-        # For HTTPS, TLS still verifies the certificate against the original hostname.
-        raw = socket.create_connection((ip, port), timeout=8)
-        if scheme == "https":
-            ctx = ssl.create_default_context()
-            sock = ctx.wrap_socket(raw, server_hostname=hostname)
-            conn = http.client.HTTPSConnection(hostname, timeout=8)
-        else:
-            sock = raw
-            conn = http.client.HTTPConnection(ip, timeout=8)
-        conn.sock = sock  # inject pre-connected socket; skips connect() / second DNS lookup
-        conn.request("GET", path, headers={"User-Agent": "Mozilla/5.0", "Host": hostname})
-        resp = conn.getresponse()
-        if resp.status != 200:
-            conn.close()
-            return None
-        data = b""
-        while chunk := resp.read(65536):
-            data += chunk
-            if len(data) > MAX_IMAGE_BYTES:
+        # Follow redirects (CDNs like Spoonacular use them), but re-validate each
+        # hop with _resolve_safe so SSRF protection is never bypassed.
+        current_url = url
+        for _ in range(5):
+            resolved = _resolve_safe(current_url)
+            if resolved is None:
+                return None
+            scheme, ip, port, path, hostname = resolved
+            raw = socket.create_connection((ip, port), timeout=8)
+            if scheme == "https":
+                ctx = ssl.create_default_context()
+                sock = ctx.wrap_socket(raw, server_hostname=hostname)
+                conn = http.client.HTTPSConnection(hostname, timeout=8)
+            else:
+                sock = raw
+                conn = http.client.HTTPConnection(ip, timeout=8)
+            conn.sock = sock  # inject pre-connected socket; skips connect() / second DNS lookup
+            conn.request("GET", path, headers={"User-Agent": "Mozilla/5.0", "Host": hostname})
+            resp = conn.getresponse()
+            if resp.status in (301, 302, 303, 307, 308):
+                location = resp.getheader("Location")
+                conn.close()
+                if not location:
+                    return None
+                # Resolve relative redirects
+                if location.startswith("/"):
+                    current_url = f"{scheme}://{hostname}{location}"
+                else:
+                    current_url = location
+                continue
+            if resp.status != 200:
                 conn.close()
                 return None
-        conn.close()
+            data = b""
+            while chunk := resp.read(65536):
+                data += chunk
+                if len(data) > MAX_IMAGE_BYTES:
+                    conn.close()
+                    return None
+            conn.close()
+            break
+        else:
+            return None  # exceeded redirect limit
         fmt = _get_image_format(data)
         if fmt is None:
             return None
