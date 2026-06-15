@@ -406,23 +406,24 @@ function renderFridge() {
       <div class="card-actions">
         ${fridgeView === 'rows' ? `
         <button class="btn btn-ghost btn-sm icon-btn" title="Edit"           onclick="openEditModal('fridge', ${item.id})">✏️</button>
-        <button class="btn btn-success btn-sm icon-btn" title="Save to Library" onclick="saveToLibrary(${item.id}, '${esc(item.name)}')">📚</button>
-        <button class="btn btn-danger btn-sm icon-btn" title="Remove"        onclick="removeFromFridge(${item.id}, '${esc(item.name)}')">🗑</button>
+        <button class="btn btn-success btn-sm icon-btn" title="Save to Library" onclick="saveToLibrary(${item.id})">📚</button>
+        <button class="btn btn-danger btn-sm icon-btn" title="Remove"        onclick="removeFromFridge(${item.id})">🗑</button>
         ` : `
         <button class="btn btn-ghost btn-sm" onclick="openEditModal('fridge', ${item.id})">✏️ Edit</button>
-        <button class="btn btn-success btn-sm" onclick="saveToLibrary(${item.id}, '${esc(item.name)}')">📚 Save</button>
-        <button class="btn btn-danger btn-sm" onclick="removeFromFridge(${item.id}, '${esc(item.name)}')">🗑 Remove</button>
+        <button class="btn btn-success btn-sm" onclick="saveToLibrary(${item.id})">📚 Save</button>
+        <button class="btn btn-danger btn-sm" onclick="removeFromFridge(${item.id})">🗑 Remove</button>
         `}
       </div>
     </div>
   `).join('');
 }
 
-async function removeFromFridge(id, name) {
+async function removeFromFridge(id) {
   try {
     const result = await apiFetch(`/api/fridge/${id}`, { method: 'DELETE' });
+    const item = fridgeItems.find(i => i.id === id);
+    const name = item ? item.name : '';
     if (result.quantity > 0) {
-      const item = fridgeItems.find(i => i.id === id);
       if (item) item.quantity = result.quantity;
       renderFridge();
       toast(`Removed one "${name}" — ${result.quantity} remaining`);
@@ -436,9 +437,10 @@ async function removeFromFridge(id, name) {
   }
 }
 
-async function saveToLibrary(id, name) {
+async function saveToLibrary(id) {
   try {
     const saved = await apiFetch(`/api/fridge/${id}/save-to-library`, { method: 'POST' });
+    const name = (fridgeItems.find(i => i.id === id) ?? saved).name;
     const alreadyExists = libraryItems.some(i => i.id === saved.id);
     if (alreadyExists) {
       toast(`"${name}" is already in the library`);
@@ -515,12 +517,12 @@ function renderLibrary() {
       <div class="card-actions">
         ${libraryView === 'rows' ? `
         <button class="btn btn-ghost btn-sm icon-btn"   title="Edit"   onclick="openEditModal('library', ${item.id})">✏️</button>
-        <button class="btn btn-primary btn-sm icon-btn" title="Add to Fridge" onclick="addFromLibrary(${item.id}, '${esc(item.name)}')">➕</button>
-        <button class="btn btn-danger btn-sm icon-btn"  title="Delete" onclick="deleteFromLibrary(${item.id}, '${esc(item.name)}')">🗑</button>
+        <button class="btn btn-primary btn-sm icon-btn" title="Add to Fridge" onclick="addFromLibrary(${item.id})">➕</button>
+        <button class="btn btn-danger btn-sm icon-btn"  title="Delete" onclick="deleteFromLibrary(${item.id})">🗑</button>
         ` : `
         <button class="btn btn-ghost btn-sm" onclick="openEditModal('library', ${item.id})">✏️ Edit</button>
-        <button class="btn btn-primary btn-sm" onclick="addFromLibrary(${item.id}, '${esc(item.name)}')">➕ Add</button>
-        <button class="btn btn-danger btn-sm" onclick="deleteFromLibrary(${item.id}, '${esc(item.name)}')">🗑</button>
+        <button class="btn btn-primary btn-sm" onclick="addFromLibrary(${item.id})">➕ Add</button>
+        <button class="btn btn-danger btn-sm" onclick="deleteFromLibrary(${item.id})">🗑</button>
         `}
       </div>
     </div>
@@ -538,7 +540,7 @@ function renderQuickAdd() {
 
   section.style.display = 'block';
   grid.innerHTML = libraryItems.slice(0, 8).map(item => `
-    <div class="card" style="cursor:pointer;" onclick="quickAddFromLibrary(${item.id}, '${esc(item.name)}')">
+    <div class="card" style="cursor:pointer;" onclick="quickAddFromLibrary(${item.id})">
       ${cardImage(item.default_image_path, '🥘')}
       <div class="card-body">
         <div class="card-name" style="font-size:0.9rem;">${esc(item.name)}</div>
@@ -547,16 +549,19 @@ function renderQuickAdd() {
   `).join('');
 }
 
-function addFromLibrary(id, name) {
-  openAddModal(id, name);
+function addFromLibrary(id) {
+  const item = libraryItems.find(i => i.id === id);
+  openAddModal(id, item ? item.name : '');
 }
 
-function quickAddFromLibrary(id, name) {
-  openAddModal(id, name);
+function quickAddFromLibrary(id) {
+  const item = libraryItems.find(i => i.id === id);
+  openAddModal(id, item ? item.name : '');
 }
 
-async function deleteFromLibrary(id, name) {
+async function deleteFromLibrary(id) {
   try {
+    const name = (libraryItems.find(i => i.id === id) ?? {}).name ?? '';
     await apiFetch(`/api/library/${id}`, { method: 'DELETE' });
     libraryItems = libraryItems.filter(i => i.id !== id);
     renderLibrary();
