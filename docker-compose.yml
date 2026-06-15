@@ -1,3 +1,5 @@
+name: witf
+
 services:
   witf:
     build: .
